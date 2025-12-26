@@ -255,28 +255,59 @@ def stratified_split_indices(dataset: FusionDataset, val_ratio: float = 0.2, fg_
 
 
 def build_datasets(data_dir: str, dataset_type: str, val_ratio: float, fg_threshold: float) -> Tuple[Subset, Subset, Dict[str, np.ndarray]]:
+    """
+    FIX DATA LEAKAGE: Tạo train/val datasets với kiểm tra overlap
+    """
+    # Tạo dataset với augment_factor=1 để tính foreground ratio trên ảnh gốc
     full_dataset = FusionDataset(
         data_dir,
         split='train',
         dataset_type=dataset_type,
         target_type='bce',
         out_channels_if_fusion=1,
+        augment_factor=1,  # FIX: Không augment khi tính split indices
     )
 
     split_info = stratified_split_indices(full_dataset, val_ratio=val_ratio, fg_threshold=fg_threshold)
-    train_dataset = Subset(full_dataset, split_info["train_indices"])
 
-    val_base_dataset = FusionDataset(
+    # ==========================================================================
+    # FIX: Kiểm tra DATA LEAKAGE - đảm bảo không có overlap
+    # ==========================================================================
+    train_set = set(split_info["train_indices"].tolist())
+    val_set = set(split_info["val_indices"].tolist())
+    overlap = train_set.intersection(val_set)
+    if overlap:
+        raise RuntimeError(f"DATA LEAKAGE DETECTED: {len(overlap)} overlapping sample indices!")
+    logger.info(f"Data leakage check PASSED: No overlap between train and val sets")
+
+    # Lấy danh sách sample paths cho train và val
+    train_samples = [full_dataset.samples[i] for i in split_info["train_indices"]]
+    val_samples = [full_dataset.samples[i] for i in split_info["val_indices"]]
+
+    # FIX: Tạo RIÊNG BIỆT train dataset (với augmentation) và val dataset (không augmentation)
+    train_dataset_full = FusionDataset(
+        data_dir,
+        split='train',
+        dataset_type=dataset_type,
+        target_type='bce',
+        out_channels_if_fusion=1,
+        augment_factor=4,  # Augmentation cho train
+    )
+    train_dataset_full.samples = train_samples  # Chỉ chứa train samples
+
+    val_dataset_full = FusionDataset(
         data_dir,
         split='val',
         dataset_type=dataset_type,
         target_type='bce',
         out_channels_if_fusion=1,
+        augment_factor=1,  # Không augmentation cho val
     )
-    val_base_dataset.samples = list(full_dataset.samples)
-    val_dataset = Subset(val_base_dataset, split_info["val_indices"])
+    val_dataset_full.samples = val_samples  # Chỉ chứa val samples
 
-    return train_dataset, val_dataset, split_info
+    logger.info(f"Original samples - Train: {len(train_samples)}, Val: {len(val_samples)}")
+
+    return train_dataset_full, val_dataset_full, split_info
 
 
 # --------------------------- TRAINING LOOP --------------------------- #

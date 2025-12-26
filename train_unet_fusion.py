@@ -801,43 +801,64 @@ def train_unet_fusion(
     logger.info(f"🔄 Gradient accumulation steps: {gradient_accumulation_steps}")
     logger.info(f"📊 Effective batch size: {effective_batch_size}")
 
-    # Create dataset based on dataset_type
-    full_dataset = FusionDataset(data_dir, split='train', dataset_type=dataset_type)
+    # ==========================================================================
+    # FIX DATA LEAKAGE: Split TRƯỚC khi augment, đảm bảo không có overlap
+    # ==========================================================================
 
-    # Calculate foreground ratios for stratification
+    # Tạo dataset với augment_factor=1 để tính foreground ratio trên ảnh gốc
+    full_dataset = FusionDataset(data_dir, split='train', dataset_type=dataset_type, augment_factor=1)
+    num_original_samples = len(full_dataset.samples)
+    logger.info(f"Total original samples: {num_original_samples}")
+
+    # Calculate foreground ratios cho ORIGINAL samples (không augmented)
     fg_ratios = []
-    for i in range(len(full_dataset)):
+    for i in range(num_original_samples):
         sample = full_dataset[i]
         label = sample['label']
         fg_ratio = (label == 1).float().mean().item()
         fg_ratios.append(fg_ratio)
 
-    # Create stratified indices
-    import numpy as np
+    # Create stratified indices trên ORIGINAL sample indices
     fg_ratios = np.array(fg_ratios)
-    # Split into high/low foreground groups
     high_fg_indices = np.where(fg_ratios > 0.05)[0]  # >5% foreground
     low_fg_indices = np.where(fg_ratios <= 0.05)[0]  # <=5% foreground
 
-    # Stratified split
-    np.random.seed(42)  # For reproducibility
-    np.random.shuffle(high_fg_indices)
-    np.random.shuffle(low_fg_indices)
+    # Stratified split với fixed seed
+    rng = np.random.default_rng(42)  # Reproducible
+    rng.shuffle(high_fg_indices)
+    rng.shuffle(low_fg_indices)
 
     train_high = high_fg_indices[:int(0.8 * len(high_fg_indices))]
     val_high = high_fg_indices[int(0.8 * len(high_fg_indices)):]
     train_low = low_fg_indices[:int(0.8 * len(low_fg_indices))]
     val_low = low_fg_indices[int(0.8 * len(low_fg_indices)):]
 
-    train_indices = np.concatenate([train_high, train_low])
-    val_indices = np.concatenate([val_high, val_low])
+    train_sample_indices = np.concatenate([train_high, train_low])
+    val_sample_indices = np.concatenate([val_high, val_low])
 
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    val_base_dataset = FusionDataset(data_dir, split='val', dataset_type=dataset_type)
-    val_base_dataset.samples = list(full_dataset.samples)
-    val_dataset = torch.utils.data.Subset(val_base_dataset, val_indices)
+    # ==========================================================================
+    # FIX: Kiểm tra DATA LEAKAGE - đảm bảo không có overlap
+    # ==========================================================================
+    train_set = set(train_sample_indices.tolist())
+    val_set = set(val_sample_indices.tolist())
+    overlap = train_set.intersection(val_set)
+    if overlap:
+        raise RuntimeError(f"DATA LEAKAGE DETECTED: {len(overlap)} overlapping sample indices!")
+    logger.info(f"Data leakage check PASSED: No overlap between train and val sets")
 
-    logger.info(f"Stratified split: Train={len(train_dataset)}, Val={len(val_dataset)}")
+    # Lấy danh sách sample paths cho train và val
+    train_samples = [full_dataset.samples[i] for i in train_sample_indices]
+    val_samples = [full_dataset.samples[i] for i in val_sample_indices]
+
+    # FIX: Tạo RIÊNG BIỆT train dataset (với augmentation) và val dataset (không augmentation)
+    train_dataset = FusionDataset(data_dir, split='train', dataset_type=dataset_type, augment_factor=4)
+    train_dataset.samples = train_samples  # Chỉ chứa train samples
+
+    val_dataset = FusionDataset(data_dir, split='val', dataset_type=dataset_type, augment_factor=1)
+    val_dataset.samples = val_samples  # Chỉ chứa val samples
+
+    logger.info(f"Stratified split: Train={len(train_dataset)} (augmented), Val={len(val_dataset)}")
+    logger.info(f"Original samples - Train: {len(train_samples)}, Val: {len(val_samples)}")
     logger.info(f"High FG samples - Train: {len(train_high)}, Val: {len(val_high)}")
     logger.info(f"Low FG samples - Train: {len(train_low)}, Val: {len(val_low)}")
 
@@ -902,6 +923,14 @@ def train_unet_fusion(
         eps=1e-8,
         betas=(0.9, 0.999)
     )
+
+    # FIX: Thêm LR scheduler (CosineAnnealingLR)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=lr / 100  # Min LR = 1% of initial LR
+    )
+    logger.info(f"LR Scheduler: CosineAnnealingLR with T_max={epochs}, eta_min={lr/100:.6f}")
 
     # FIXED: Aggressive early stopping to prevent overfitting
     best_iou = 0.0
@@ -1087,6 +1116,7 @@ def train_unet_fusion(
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'epoch': epoch,
                 'best_iou': best_iou,
                 'best_dice': val_metrics['dice']
@@ -1096,12 +1126,21 @@ def train_unet_fusion(
         else:
             patience_counter += 1
 
+        # FIX: Step the LR scheduler
+        scheduler.step()
+
+        # FIX: Early stopping THỰC SỰ hoạt động
+        if patience_counter >= patience:
+            logger.info(f"Early stopping triggered after {epoch + 1} epochs (no improvement for {patience} epochs)")
+            break
+
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'best_iou': best_iou,
                 'train_losses': train_losses,
                 'val_losses': val_losses,
@@ -1110,7 +1149,6 @@ def train_unet_fusion(
                 'train_dices': train_dices,
                 'val_dices': val_dices
             }, f'checkpoints_unet_{dataset_type}/checkpoint_epoch_{epoch+1:03d}_{dataset_type}.pth')
-
 
     # Generate results
     logger.info("\n" + "="*60)

@@ -528,13 +528,18 @@ class CSWinSimAMUNet(nn.Module):
         self.simam4 = SimAM(self.feature_dims[3])
 
         # UNet Decoder with attention gates
+        # FIX: Điều chỉnh input channels để attention gate output được sử dụng đúng
         self.att_gate4 = AttentionGate(self.feature_dims[3], self.feature_dims[2], self.feature_dims[2]//2)
         self.att_gate3 = AttentionGate(self.feature_dims[2], self.feature_dims[1], self.feature_dims[1]//2)
         self.att_gate2 = AttentionGate(self.feature_dims[1], self.feature_dims[0], self.feature_dims[0]//2)
 
-        self.decoder4 = self._make_decoder_stage(self.feature_dims[3], self.feature_dims[2], self.feature_dims[2])
-        self.decoder3 = self._make_decoder_stage(self.feature_dims[2] + self.feature_dims[2]//2, self.feature_dims[1], self.feature_dims[1])
-        self.decoder2 = self._make_decoder_stage(self.feature_dims[1] + self.feature_dims[1]//2, self.feature_dims[0], self.feature_dims[0])
+        # FIX: Decoder4 nhận concat của upsampled bottleneck + attention-gated skip
+        # decoder4: 512 (upsampled) + 256 (attention gated skip) = 768 -> 256
+        self.decoder4 = self._make_decoder_stage(self.feature_dims[3] + self.feature_dims[2], self.feature_dims[2], self.feature_dims[2])
+        # decoder3: 256 (upsampled) + 128 (attention gated skip) = 384 -> 128
+        self.decoder3 = self._make_decoder_stage(self.feature_dims[2] + self.feature_dims[1], self.feature_dims[1], self.feature_dims[1])
+        # decoder2: 128 (upsampled) + 64 (attention gated skip) = 192 -> 64
+        self.decoder2 = self._make_decoder_stage(self.feature_dims[1] + self.feature_dims[0], self.feature_dims[0], self.feature_dims[0])
         self.decoder1 = self._make_decoder_stage(self.feature_dims[0], 32, 32)
 
         # Final output head
@@ -633,19 +638,21 @@ class CSWinSimAMUNet(nn.Module):
         x4_2d = self.simam4(x4_2d)
 
         # UNet Decoder with skip connections and attention gates
-        # Decoder 4
-        d4 = F.interpolate(x4_2d, size=features[2].shape[-2:], mode='bilinear', align_corners=False)
-        x3_att = self.att_gate4(d4, features[2])
-        d4 = self.decoder4(d4)
+        # FIX: Sử dụng attention gate output đúng cách cho TẤT CẢ decoder stages
 
-        # Decoder 3
+        # Decoder 4: upsample bottleneck + attention-gated skip from stage3
+        d4 = F.interpolate(x4_2d, size=features[2].shape[-2:], mode='bilinear', align_corners=False)
+        x3_att = self.att_gate4(d4, features[2])  # Attention gate: gating signal=d4, skip=features[2]
+        d4 = self.decoder4(torch.cat([d4, x3_att], dim=1))  # FIX: Concat và decode
+
+        # Decoder 3: upsample d4 + attention-gated skip from stage2
         d3 = F.interpolate(d4, size=features[1].shape[-2:], mode='bilinear', align_corners=False)
-        x2_att = self.att_gate3(d3, features[1])
+        x2_att = self.att_gate3(d3, features[1])  # Attention gate: gating signal=d3, skip=features[1]
         d3 = self.decoder3(torch.cat([d3, x2_att], dim=1))
 
-        # Decoder 2
+        # Decoder 2: upsample d3 + attention-gated skip from stage1
         d2 = F.interpolate(d3, size=features[0].shape[-2:], mode='bilinear', align_corners=False)
-        x1_att = self.att_gate2(d2, features[0])
+        x1_att = self.att_gate2(d2, features[0])  # Attention gate: gating signal=d2, skip=features[0]
         d2 = self.decoder2(torch.cat([d2, x1_att], dim=1))
 
         # Decoder 1 (no skip connection, just upsampling)
@@ -661,7 +668,12 @@ class CSWinSimAMUNet(nn.Module):
 # ======================== ADVANCED DATASET WITH STRONG AUGMENTATION ========================
 
 class FusionDataset(torch.utils.data.Dataset):
-    def __init__(self, data_dir, split='train', img_size=224, dataset_type='fusion'):
+    """
+    Dataset cho crack segmentation với paired augmentation đồng bộ.
+    FIX: Sử dụng torchvision.transforms.functional để đảm bảo image và mask
+    được augment với cùng tham số ngẫu nhiên.
+    """
+    def __init__(self, data_dir, split='train', img_size=224, dataset_type='fusion', augment_factor=None):
         self.data_dir = data_dir
         self.split = split
         self.img_size = img_size
@@ -673,7 +685,7 @@ class FusionDataset(torch.utils.data.Dataset):
         else:  # fusion
             self.image_dir = os.path.join(data_dir, '03-Fusion(50IRT) images')
         self.label_dir = os.path.join(data_dir, '04-Ground truth')
-        
+
         # Find all valid image-label pairs
         self.samples = []
         for ext in ['*.png', '*.jpg', '*.jpeg']:
@@ -687,147 +699,140 @@ class FusionDataset(torch.utils.data.Dataset):
                     self.samples.append((img_path, label_path_png))
                 elif os.path.exists(label_path_jpg):
                     self.samples.append((img_path, label_path_jpg))
-        
+
         logger.info(f"Found {len(self.samples)} valid {dataset_type.upper()} samples for {split}")
-        
-        # BALANCED augmentation for high validation IoU
-        if split == 'train':
-            if dataset_type == 'rgb':
-                self.transform = transforms.Compose([
-                    transforms.ToPILImage(mode='RGB'),
-                    transforms.Resize((img_size, img_size)),
-                    transforms.RandomHorizontalFlip(p=0.6),
-                    transforms.RandomVerticalFlip(p=0.6),
-                    transforms.RandomRotation((-45, 45)),  # More aggressive rotation
-                    transforms.RandomAffine(
-                        degrees=0,
-                        translate=(0.15, 0.15),  # More translation for robustness
-                        scale=(0.75, 1.25),      # More scaling variation
-                        shear=(-8, 8)            # Moderate shearing
-                    ),
-                    transforms.ColorJitter(brightness=0.3, contrast=0.3),  # More variation
-                    transforms.ToTensor()
-                ])
-            else:  # fusion
-                self.transform = transforms.Compose([
-                    transforms.ToPILImage(mode='L'),
-                    transforms.Resize((img_size, img_size)),
-                    transforms.RandomHorizontalFlip(p=0.6),
-                    transforms.RandomVerticalFlip(p=0.6),
-                    transforms.RandomRotation((-45, 45)),  # More aggressive rotation
-                    transforms.RandomAffine(
-                        degrees=0,
-                        translate=(0.15, 0.15),  # More translation for robustness
-                        scale=(0.75, 1.25),      # More scaling variation
-                        shear=(-8, 8)            # Moderate shearing
-                    ),
-                    transforms.ColorJitter(brightness=0.3, contrast=0.3),  # More variation
-                    transforms.ToTensor()
-                ])
 
-            # Balanced augmentation for better generalization
-            self.augment_factor = 4  # 4x augmentation for better validation performance
-
-            self.mask_transform = transforms.Compose([
-                transforms.ToPILImage(mode='L'),
-                transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.NEAREST),
-                transforms.ToTensor()
-            ])
+        # FIX: Cho phép override augment_factor, mặc định 4 cho train, 1 cho val
+        if augment_factor is not None:
+            self.augment_factor = augment_factor
         else:
-            if dataset_type == 'rgb':
-                self.transform = transforms.Compose([
-                    transforms.ToPILImage(mode='RGB'),
-                    transforms.Resize((img_size, img_size)),
-                    transforms.ToTensor()
-                ])
-            else:  # fusion
-                self.transform = transforms.Compose([
-                    transforms.ToPILImage(mode='L'),
-                    transforms.Resize((img_size, img_size)),
-                    transforms.ToTensor()
-                ])
-            self.augment_factor = 1  # No augmentation for validation
+            self.augment_factor = 4 if split == 'train' else 1
 
-        self.mask_transform = transforms.Compose([
-            transforms.ToPILImage(mode='L'),
-            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.NEAREST),
-            transforms.ToTensor()
-        ])
+        # Color jitter chỉ áp dụng cho image, không áp dụng cho mask
+        if split == 'train':
+            self.color_jitter = transforms.ColorJitter(brightness=0.3, contrast=0.3)
+        else:
+            self.color_jitter = None
+
+        # Normalization parameters
+        if dataset_type == 'rgb':
+            self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                   std=[0.229, 0.224, 0.225])
+        else:
+            self.normalize = transforms.Normalize(mean=[0.5], std=[0.5])
+
+    # --------- Paired augmentation helpers (FIX: đồng bộ image và mask) ---------
+    def _resize_pair(self, img, msk):
+        """Resize cả image và mask về cùng kích thước"""
+        from torchvision.transforms import functional as TF
+        from torchvision.transforms import InterpolationMode
+        img = TF.resize(img, (self.img_size, self.img_size), interpolation=InterpolationMode.BILINEAR)
+        msk = TF.resize(msk, (self.img_size, self.img_size), interpolation=InterpolationMode.NEAREST)
+        return img, msk
+
+    def _maybe_hflip(self, img, msk, p=0.6):
+        """Random horizontal flip cho CẢ image và mask"""
+        from torchvision.transforms import functional as TF
+        if random.random() < p:
+            img = TF.hflip(img)
+            msk = TF.hflip(msk)
+        return img, msk
+
+    def _maybe_vflip(self, img, msk, p=0.6):
+        """Random vertical flip cho CẢ image và mask"""
+        from torchvision.transforms import functional as TF
+        if random.random() < p:
+            img = TF.vflip(img)
+            msk = TF.vflip(msk)
+        return img, msk
+
+    def _random_rotate(self, img, msk, low=-45, high=45):
+        """Random rotation cho CẢ image và mask với cùng góc"""
+        from torchvision.transforms import functional as TF
+        from torchvision.transforms import InterpolationMode
+        angle = random.uniform(low, high)
+        img = TF.rotate(img, angle, interpolation=InterpolationMode.BILINEAR, fill=0)
+        msk = TF.rotate(msk, angle, interpolation=InterpolationMode.NEAREST, fill=0)
+        return img, msk
+
+    def _random_affine(self, img, msk, max_translate=0.15, scale_range=(0.75, 1.25), shear_range=(-8, 8)):
+        """Random affine transform cho CẢ image và mask với cùng tham số"""
+        from torchvision.transforms import functional as TF
+        from torchvision.transforms import InterpolationMode
+        tx = int(max_translate * self.img_size)
+        ty = int(max_translate * self.img_size)
+        translate = (random.randint(-tx, tx), random.randint(-ty, ty))
+        scale = random.uniform(scale_range[0], scale_range[1])
+        shear = random.uniform(shear_range[0], shear_range[1])
+
+        img = TF.affine(img, angle=0, translate=translate, scale=scale, shear=[shear, 0],
+                        interpolation=InterpolationMode.BILINEAR, fill=0)
+        msk = TF.affine(msk, angle=0, translate=translate, scale=scale, shear=[shear, 0],
+                        interpolation=InterpolationMode.NEAREST, fill=0)
+        return img, msk
     
     def __len__(self):
         return len(self.samples) * self.augment_factor
 
     def __getitem__(self, idx):
+        """
+        FIX: Sử dụng paired augmentation đồng bộ cho image và mask
+        """
+        from torchvision.transforms import functional as TF
+        from PIL import Image as PILImage
+
         # Map augmented index back to original sample
         original_idx = idx // self.augment_factor
-        augment_idx = idx % self.augment_factor
 
         img_path, label_path = self.samples[original_idx]
 
-        # Get original filename without extension
-        filename = os.path.splitext(os.path.basename(img_path))[0]
-        
-        # Load image based on dataset type
+        # Load image và mask bằng PIL để tránh vấn đề BGR/RGB
         if self.dataset_type == 'rgb':
-            image = cv2.imread(img_path, cv2.IMREAD_COLOR)
-            if image is None:
-                image = np.array(Image.open(img_path).convert('RGB'))
-            else:
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
+            img = PILImage.open(img_path).convert('RGB')
         else:  # fusion
-            image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            if image is None:
-                image = np.array(Image.open(img_path).convert('L'))
-        
-        # Load label
-        label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
-        if label is None:
-            label = np.array(Image.open(label_path).convert('L'))
+            img = PILImage.open(img_path).convert('L')
+        msk = PILImage.open(label_path).convert('L')
 
-        # Apply transforms
+        # Resize trước
+        img, msk = self._resize_pair(img, msk)
+
+        # FIX: Áp dụng paired augmentation đồng bộ cho CẢ image và mask
         if self.split == 'train':
-            # Apply same random transforms to both image and mask
-            seed = np.random.randint(2147483647)
+            img, msk = self._maybe_hflip(img, msk, p=0.6)
+            img, msk = self._maybe_vflip(img, msk, p=0.6)
+            img, msk = self._random_rotate(img, msk, low=-45, high=45)
+            img, msk = self._random_affine(img, msk, max_translate=0.15,
+                                            scale_range=(0.75, 1.25), shear_range=(-8, 8))
 
-            # Transform image
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            image = self.transform(image)
+            # Color jitter CHỈ cho image, không cho mask
+            if self.color_jitter is not None:
+                img = self.color_jitter(img)
 
-            # Transform mask with same seed
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            label = self.mask_transform(label)
-        else:
-            image = self.transform(image)
-            label = self.mask_transform(label)
+        # Convert to tensor
+        image = TF.to_tensor(img)  # CxHxW, float32 in [0,1]
 
-        # Convert to binary mask
-        label = (label.squeeze() > 0.5).long()
-        
-        # Create 4-channel input (RGB + Fusion)
-        # Return appropriate channels based on dataset type
+        # Normalize image
+        if self.dataset_type == 'rgb' and image.shape[0] == 3:
+            image = self.normalize(image)
+        elif self.dataset_type != 'rgb' and image.shape[0] == 1:
+            image = self.normalize(image)
+
+        # Convert mask to tensor và binary
+        label = TF.to_tensor(msk).squeeze(0)  # HxW
+        label = (label > 0.5).long()
+
+        # Đảm bảo số kênh đầu vào phù hợp
         if self.dataset_type == 'rgb':
-            # For RGB: return 3 channels
-            if len(image.shape) == 3 and image.shape[0] == 3:
-                input_tensor = image  # Already 3 channels
-            else:
-                # Single channel, repeat to create RGB
-                if len(image.shape) == 2:
-                    image = image.unsqueeze(0)
-                input_tensor = image.repeat(3, 1, 1)
+            if image.shape[0] != 3:
+                image = image.repeat(3, 1, 1)
         else:  # fusion
-            # For fusion: return 1 channel
-            if len(image.shape) == 3 and image.shape[0] == 3:
-                input_tensor = image[0:1]  # Use first channel only
-            else:
-                # Single channel fusion
-                if len(image.shape) == 2:
-                    image = image.unsqueeze(0)
-                input_tensor = image
-        
+            if image.shape[0] == 3:
+                image = image[0:1]  # Lấy 1 kênh
+            elif image.shape[0] != 1:
+                image = image.unsqueeze(0) if len(image.shape) == 2 else image[0:1]
+
         return {
-            'image': input_tensor,
+            'image': image,
             'label': label,
             'case_name': os.path.splitext(os.path.basename(img_path))[0]
         }
@@ -1133,48 +1138,67 @@ def train_cswin_simam_unet(data_dir='./data_ir', epochs=100, batch_size=None, lr
     logger.info(f"🔄 Gradient accumulation steps: {gradient_accumulation_steps}")
     logger.info(f"📊 Effective batch size: {effective_batch_size}")
 
-    # Create dataset based on dataset_type
-    full_dataset = FusionDataset(data_dir, split='train', dataset_type=dataset_type)
+    # ==========================================================================
+    # FIX DATA LEAKAGE: Split dựa trên ORIGINAL samples, không phải augmented
+    # ==========================================================================
 
-    # Calculate foreground ratios for stratification
+    # Tạo dataset với augment_factor=1 để tính foreground ratio trên ảnh gốc
+    base_dataset = FusionDataset(data_dir, split='train', dataset_type=dataset_type, augment_factor=1)
+    num_original_samples = len(base_dataset.samples)
+
+    logger.info(f"Total original samples: {num_original_samples}")
+
+    # Calculate foreground ratios cho ORIGINAL samples (không augmented)
     fg_ratios = []
-    for i in range(len(full_dataset)):
-        sample = full_dataset[i]
+    for i in range(num_original_samples):
+        sample = base_dataset[i]
         label = sample['label']
         fg_ratio = (label == 1).float().mean().item()
         fg_ratios.append(fg_ratio)
 
-    # Create stratified indices
-    import numpy as np
+    # Create stratified indices trên ORIGINAL sample indices
     fg_ratios = np.array(fg_ratios)
-    # Split into high/low foreground groups
     high_fg_indices = np.where(fg_ratios > 0.05)[0]  # >5% foreground
     low_fg_indices = np.where(fg_ratios <= 0.05)[0]  # <=5% foreground
 
-    # Stratified split
-    np.random.seed(42)  # For reproducibility
-    np.random.shuffle(high_fg_indices)
-    np.random.shuffle(low_fg_indices)
+    # Stratified split với fixed seed
+    rng = np.random.default_rng(42)  # Reproducible
+    rng.shuffle(high_fg_indices)
+    rng.shuffle(low_fg_indices)
 
     train_high = high_fg_indices[:int(0.8 * len(high_fg_indices))]
     val_high = high_fg_indices[int(0.8 * len(high_fg_indices)):]
     train_low = low_fg_indices[:int(0.8 * len(low_fg_indices))]
     val_low = low_fg_indices[int(0.8 * len(low_fg_indices)):]
 
-    train_indices = np.concatenate([train_high, train_low])
-    val_indices = np.concatenate([val_high, val_low])
+    train_sample_indices = np.concatenate([train_high, train_low])
+    val_sample_indices = np.concatenate([val_high, val_low])
 
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+    # ==========================================================================
+    # FIX: Kiểm tra DATA LEAKAGE - đảm bảo không có overlap
+    # ==========================================================================
+    train_set = set(train_sample_indices.tolist())
+    val_set = set(val_sample_indices.tolist())
+    overlap = train_set.intersection(val_set)
+    if overlap:
+        raise RuntimeError(f"DATA LEAKAGE DETECTED: {len(overlap)} overlapping sample indices!")
+    logger.info(f"Data leakage check PASSED: No overlap between train and val sets")
 
-    logger.info(f"Stratified split: Train={len(train_dataset)}, Val={len(val_dataset)}")
+    # Lấy danh sách sample paths cho train và val
+    train_samples = [base_dataset.samples[i] for i in train_sample_indices]
+    val_samples = [base_dataset.samples[i] for i in val_sample_indices]
+
+    # Tạo RIÊNG BIỆT train dataset (với augmentation) và val dataset (không augmentation)
+    train_dataset = FusionDataset(data_dir, split='train', dataset_type=dataset_type, augment_factor=4)
+    train_dataset.samples = train_samples  # Chỉ chứa train samples
+
+    val_dataset = FusionDataset(data_dir, split='val', dataset_type=dataset_type, augment_factor=1)
+    val_dataset.samples = val_samples  # Chỉ chứa val samples
+
+    logger.info(f"Stratified split: Train={len(train_dataset)} (augmented), Val={len(val_dataset)}")
+    logger.info(f"Original samples - Train: {len(train_samples)}, Val: {len(val_samples)}")
     logger.info(f"High FG samples - Train: {len(train_high)}, Val: {len(val_high)}")
     logger.info(f"Low FG samples - Train: {len(train_low)}, Val: {len(val_low)}")
-
-    # Update val_dataset transform
-    val_dataset.dataset.split = 'val'
-    val_transform_dataset = FusionDataset(data_dir, split='val', dataset_type=dataset_type)
-    val_dataset.dataset.transform = val_transform_dataset.transform
 
     # Create data loaders with maximum performance optimization
     num_workers = min(8, os.cpu_count())  # Use more workers for better performance
