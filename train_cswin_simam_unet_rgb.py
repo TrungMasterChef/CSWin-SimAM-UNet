@@ -1436,6 +1436,11 @@ def train_cswin_simam_unet(data_dir='./data_ir', epochs=100, batch_size=None, lr
         else:
             patience_counter += 1
 
+        # FIX: Early stopping THỰC SỰ hoạt động
+        if patience_counter >= patience:
+            logger.info(f"Early stopping triggered after {epoch + 1} epochs (no improvement for {patience} epochs)")
+            break
+
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save({

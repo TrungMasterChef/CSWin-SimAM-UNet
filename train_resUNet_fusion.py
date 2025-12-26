@@ -148,6 +148,9 @@ def calculate_metrics(pred_logits: torch.Tensor, target: torch.Tensor, threshold
     if target.dim() == 4:
         target = target.squeeze(1)
 
+    # FIX: Đảm bảo target là float để tính toán metrics
+    target = target.float()
+
     pred_bin = (pred > threshold).float()
     pred_flat = pred_bin.view(pred_bin.size(0), -1)
     target_flat = target.view(target.size(0), -1)
@@ -370,7 +373,12 @@ def train_resunet(
     }
     best_iou = 0.0
 
+    # FIX: Thêm early stopping
+    patience = 15
+    patience_counter = 0
+
     logger.info("Starting training for %d epochs...", epochs)
+    logger.info("Early stopping patience: %d", patience)
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
@@ -384,6 +392,10 @@ def train_resunet(
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
+
+            # FIX: Thêm gradient clipping để ổn định training
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             train_loss += loss.item()
@@ -440,16 +452,34 @@ def train_resunet(
 
         if val_metrics['iou'] > best_iou:
             best_iou = val_metrics['iou']
-            torch.save(model.state_dict(), os.path.join(output_dir, f'best_resunet_{dataset_type}.pth'))
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch,
+                'best_iou': best_iou,
+            }, os.path.join(output_dir, f'best_resunet_{dataset_type}.pth'))
             logger.info("New best IoU: %.4f", best_iou)
-
-        if (epoch + 1) % 10 == 0:
-            torch.save(
-                model.state_dict(),
-                os.path.join(output_dir, f'checkpoint_epoch_{epoch + 1:03d}_{dataset_type}.pth')
-            )
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
         scheduler.step()
+
+        # FIX: Early stopping thực sự hoạt động
+        if patience_counter >= patience:
+            logger.info("Early stopping triggered after %d epochs (no improvement for %d epochs)", epoch + 1, patience)
+            break
+
+        if (epoch + 1) % 10 == 0:
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch,
+                'best_iou': best_iou,
+                'history': history,
+            }, os.path.join(output_dir, f'checkpoint_epoch_{epoch + 1:03d}_{dataset_type}.pth'))
 
     history_path = os.path.join(output_dir, f'training_history_{dataset_type}.json')
     with open(history_path, 'w', encoding='utf-8') as f:
